@@ -1,13 +1,12 @@
-import asyncio
 import os
+import re
 import time
-from datetime import date, timedelta
-from threading import Thread
+import threading
+from datetime import date, datetime, timedelta
 
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from flask import Flask
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # ─── Keep-alive Flask server ──────────────────────────────────────────────────
 
@@ -18,15 +17,20 @@ def home():
     return "I am alive!"
 
 def keep_alive():
-    thread = Thread(target=lambda: flask_app.run(host="0.0.0.0", port=8080), daemon=True)
-    thread.start()
+    port = int(os.environ.get("PORT", 8080))
+    def run():
+        try:
+            flask_app.run(host="0.0.0.0", port=port)
+        except OSError:
+            pass
+    threading.Thread(target=run, daemon=True).start()
 
-# ─── Bot setup ────────────────────────────────────────────────────────────────
+# ─── Bot & config ─────────────────────────────────────────────────────────────
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]
+ADMIN_ID = int(os.environ["ADMIN_ID"]) if os.environ.get("ADMIN_ID") else None
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
 VENUES = ["самал", "ататюрк", "арбат"]
 
@@ -36,64 +40,19 @@ VENUE_EMOJI = {
     "арбат": "🎸",
 }
 
-bookings: dict[str, dict[str, dict[str, dict]]] = {venue: {} for venue in VENUES}
-pending_bookings: dict[int, dict] = {}
-delete_queue: list[tuple[float, int, int]] = []
-booking_ttl_queue: list[tuple[float, str, str, str]] = []
+bookings:         dict = {venue: {} for venue in VENUES}
+pending_bookings: dict = {}
+delete_queue:     list = []
 
-TTL_TODAY    = 24 * 3600
-TTL_TOMORROW = 48 * 3600
 DELETE_AFTER = 60
+_lock = threading.Lock()
 
-# ─── Auto-delete messages ─────────────────────────────────────────────────────
+# ─── Admin check ──────────────────────────────────────────────────────────────
 
-def schedule_delete(msg: Message, delay: int = DELETE_AFTER) -> None:
-    delete_queue.append((time.monotonic() + delay, msg.chat.id, msg.message_id))
-
-
-async def auto_delete_loop() -> None:
-    while True:
-        await asyncio.sleep(5)
-        now = time.monotonic()
-        remaining: list[tuple[float, int, int]] = []
-        for delete_at, chat_id, message_id in delete_queue:
-            if now >= delete_at:
-                try:
-                    await bot.delete_message(chat_id, message_id)
-                except Exception:
-                    pass
-            else:
-                remaining.append((delete_at, chat_id, message_id))
-        delete_queue.clear()
-        delete_queue.extend(remaining)
-
-
-async def send_auto(message: Message, text: str, reply_markup=None, delay: int = DELETE_AFTER) -> Message:
-    sent = await message.answer(text, reply_markup=reply_markup, parse_mode="HTML")
-    schedule_delete(sent, delay)
-    return sent
-
-# ─── Auto-expire bookings ─────────────────────────────────────────────────────
-
-def schedule_booking_ttl(venue: str, date_str: str, user_name: str, ttl: int) -> None:
-    booking_ttl_queue.append((time.time() + ttl, venue, date_str, user_name))
-
-
-async def auto_expire_bookings_loop() -> None:
-    while True:
-        await asyncio.sleep(10)
-        now = time.time()
-        remaining: list[tuple[float, str, str, str]] = []
-        for expire_at, venue, date_str, user_name in booking_ttl_queue:
-            if now >= expire_at:
-                try:
-                    bookings[venue].get(date_str, {}).pop(user_name, None)
-                except Exception:
-                    pass
-            else:
-                remaining.append((expire_at, venue, date_str, user_name))
-        booking_ttl_queue.clear()
-        booking_ttl_queue.extend(remaining)
+def is_admin(user_id: int) -> bool:
+    if ADMIN_ID is None:
+        return False
+    return user_id == ADMIN_ID
 
 # ─── Date helpers ─────────────────────────────────────────────────────────────
 
@@ -103,283 +62,519 @@ def today_str() -> str:
 def tomorrow_str() -> str:
     return (date.today() + timedelta(days=1)).isoformat()
 
+def day_after_tomorrow_str() -> str:
+    return (date.today() + timedelta(days=2)).isoformat()
+
 def format_date_label(date_str: str) -> str:
-    d = date.fromisoformat(date_str)
+    d     = date.fromisoformat(date_str)
     today = date.today()
-    if d == today:
-        return f"Сегодня, {d.strftime('%d.%m')}"
-    elif d == today + timedelta(days=1):
+    if d == today + timedelta(days=1):
         return f"Завтра, {d.strftime('%d.%m')}"
+    if d == today + timedelta(days=2):
+        return f"Послезавтра, {d.strftime('%d.%m')}"
     return d.strftime("%d.%m.%Y")
 
-# ─── Schedule formatters ──────────────────────────────────────────────────────
+# ─── Background: auto-delete messages ─────────────────────────────────────────
 
-def time_to_minutes(t: str) -> int:
+def auto_delete_worker():
+    while True:
+        time.sleep(5)
+        now = time.monotonic()
+        with _lock:
+            remaining = []
+            for delete_at, chat_id, message_id in delete_queue:
+                if now >= delete_at:
+                    try:
+                        bot.delete_message(chat_id, message_id)
+                    except Exception:
+                        pass
+                else:
+                    remaining.append((delete_at, chat_id, message_id))
+            delete_queue.clear()
+            delete_queue.extend(remaining)
+
+# ─── Background: midnight calendar cleanup ────────────────────────────────────
+
+def midnight_cleanup_worker():
+    while True:
+        now           = datetime.now()
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        time.sleep((next_midnight - now).total_seconds())
+
+        today = date.today().isoformat()
+        with _lock:
+            for venue in VENUES:
+                bookings[venue].pop(today, None)
+            for venue in VENUES:
+                stale = [d for d in list(bookings[venue]) if d < today]
+                for d in stale:
+                    del bookings[venue][d]
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def schedule_delete(msg, delay: int = DELETE_AFTER):
+    with _lock:
+        delete_queue.append((time.monotonic() + delay, msg.chat.id, msg.message_id))
+
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+def parse_time(t: str) -> int:
+    if not _TIME_RE.match(t):
+        raise ValueError(f"Некорректное время: {t!r}")
     h, m = map(int, t.split(":"))
     return h * 60 + m
 
-def overlaps(s1: int, e1: int, s2: int, e2: int) -> bool:
+def time_to_minutes(t: str) -> int:
+    return parse_time(t)
+
+def overlaps(s1, e1, s2, e2) -> bool:
     return s1 < e2 and s2 < e1
 
+# ─── Schedule formatters ──────────────────────────────────────────────────────
+
 def get_schedule_text() -> str:
-    today = today_str()
     tomorrow = tomorrow_str()
-    lines = ["📋 <b>Расписание репетиций</b>\n"]
-    any_booking = any(bookings[v].get(d) for v in VENUES for d in (today, tomorrow))
+    dat      = day_after_tomorrow_str()
+    lines    = ["📋 <b>Расписание репетиций</b>\n"]
+    any_booking = any(bookings[v].get(d) for v in VENUES for d in (tomorrow, dat))
     if not any_booking:
         lines.append("✨ Все площадки свободны!")
         return "\n".join(lines)
-    for d, day_label in [(today, "📆 Сегодня"), (tomorrow, "📆 Завтра")]:
-        has_day = any(bookings[v].get(d) for v in VENUES)
-        if not has_day:
+    for d, day_label in [(tomorrow, "📆 Завтра"), (dat, "📆 Послезавтра")]:
+        if not any(bookings[v].get(d) for v in VENUES):
             continue
-        lines.append(f"{day_label}")
+        lines.append(day_label)
         lines.append("━" * 22)
         for venue in VENUES:
-            day_slots = bookings[venue].get(d, {})
-            if not day_slots:
+            slots = bookings[venue].get(d, {})
+            if not slots:
                 continue
-            emoji = VENUE_EMOJI[venue]
-            lines.append(f"\n{emoji} <b>{venue.upper()}</b>")
-            sorted_slots = sorted(day_slots.items(), key=lambda x: time_to_minutes(x[1]["start"]))
-            for i, (user, data) in enumerate(sorted_slots):
-                prefix = "  └" if i == len(sorted_slots) - 1 else "  ├"
+            lines.append(f"\n{VENUE_EMOJI[venue]} <b>{venue.upper()}</b>")
+            for i, (user, data) in enumerate(sorted(slots.items(), key=lambda x: time_to_minutes(x[1]["start"]))):
+                prefix = "  └" if i == len(slots) - 1 else "  ├"
                 lines.append(f"{prefix} <code>{data['start']} – {data['end']}</code>  👤 {user}")
         lines.append("")
     return "\n".join(lines)
 
+
 def get_day_schedule_text(date_str: str) -> str:
     label = format_date_label(date_str)
     lines = [f"📋 <b>Расписание — {label}</b>\n"]
-    has_any = any(bookings[v].get(date_str) for v in VENUES)
-    if not has_any:
+    if not any(bookings[v].get(date_str) for v in VENUES):
         lines.append("✨ Все площадки свободны!")
         return "\n".join(lines)
     for venue in VENUES:
-        day_slots = bookings[venue].get(date_str, {})
-        if not day_slots:
+        slots = bookings[venue].get(date_str, {})
+        if not slots:
             continue
-        emoji = VENUE_EMOJI[venue]
-        lines.append(f"{emoji} <b>{venue.upper()}</b>")
-        sorted_slots = sorted(day_slots.items(), key=lambda x: time_to_minutes(x[1]["start"]))
-        for i, (user, data) in enumerate(sorted_slots):
-            prefix = "  └" if i == len(sorted_slots) - 1 else "  ├"
+        lines.append(f"{VENUE_EMOJI[venue]} <b>{venue.upper()}</b>")
+        for i, (user, data) in enumerate(sorted(slots.items(), key=lambda x: time_to_minutes(x[1]["start"]))):
+            prefix = "  └" if i == len(slots) - 1 else "  ├"
             lines.append(f"{prefix} <code>{data['start']} – {data['end']}</code>  👤 {user}")
         lines.append("")
     return "\n".join(lines)
 
+
 def get_venue_schedule_text(venue: str) -> str:
-    today = today_str()
     tomorrow = tomorrow_str()
-    emoji = VENUE_EMOJI[venue]
-    lines = [f"{emoji} <b>Расписание — {venue.upper()}</b>\n"]
-    has_any = any(bookings[venue].get(d) for d in (today, tomorrow))
-    if not has_any:
+    dat      = day_after_tomorrow_str()
+    lines    = [f"{VENUE_EMOJI[venue]} <b>Расписание — {venue.upper()}</b>\n"]
+    if not any(bookings[venue].get(d) for d in (tomorrow, dat)):
         lines.append("✨ Площадка свободна!")
         return "\n".join(lines)
-    for d, day_label in [(today, "📆 Сегодня"), (tomorrow, "📆 Завтра")]:
-        day_slots = bookings[venue].get(d, {})
-        if not day_slots:
+    for d, day_label in [(tomorrow, "📆 Завтра"), (dat, "📆 Послезавтра")]:
+        slots = bookings[venue].get(d, {})
+        if not slots:
             continue
-        lines.append(f"{day_label}")
-        sorted_slots = sorted(day_slots.items(), key=lambda x: time_to_minutes(x[1]["start"]))
-        for i, (user, data) in enumerate(sorted_slots):
-            prefix = "  └" if i == len(sorted_slots) - 1 else "  ├"
+        lines.append(day_label)
+        for i, (user, data) in enumerate(sorted(slots.items(), key=lambda x: time_to_minutes(x[1]["start"]))):
+            prefix = "  └" if i == len(slots) - 1 else "  ├"
             lines.append(f"{prefix} <code>{data['start']} – {data['end']}</code>  👤 {user}")
         lines.append("")
     return "\n".join(lines)
+
+# ─── Admin panel ──────────────────────────────────────────────────────────────
+
+def get_admin_text() -> str:
+    tomorrow = tomorrow_str()
+    dat      = day_after_tomorrow_str()
+    total    = sum(len(bookings[v].get(d, {})) for v in VENUES for d in (tomorrow, dat))
+    lines    = [
+        "🔐 <b>Админ-панель</b>\n",
+        f"📊 Активных броней: <b>{total}</b>\n",
+        f"📆 <b>Завтра ({format_date_label(tomorrow)}):</b>",
+    ]
+    for venue in VENUES:
+        count = len(bookings[venue].get(tomorrow, {}))
+        lines.append(f"  {VENUE_EMOJI[venue]} {venue.upper()}: {count}")
+    lines.append(f"\n📆 <b>Послезавтра ({format_date_label(dat)}):</b>")
+    for venue in VENUES:
+        count = len(bookings[venue].get(dat, {}))
+        lines.append(f"  {VENUE_EMOJI[venue]} {venue.upper()}: {count}")
+    return "\n".join(lines)
+
+
+def get_admin_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.row(InlineKeyboardButton("📋 Всё расписание", callback_data="adm_view"))
+    kb.row(
+        InlineKeyboardButton("🗑 Завтра",       callback_data="adm_clear_tomorrow"),
+        InlineKeyboardButton("🗑 Послезавтра",  callback_data="adm_clear_dat"),
+    )
+    kb.row(InlineKeyboardButton("💣 Очистить ВСЁ", callback_data="adm_clear_all"))
+    return kb
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
 def get_main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📅 Всё расписание", callback_data="schedule")],
-            [
-                InlineKeyboardButton(text="☀️ Сегодня", callback_data="sched_day_today"),
-                InlineKeyboardButton(text="🌙 Завтра",   callback_data="sched_day_tomorrow"),
-            ],
-            [
-                InlineKeyboardButton(text="🏠 Самал",   callback_data="sched_самал"),
-                InlineKeyboardButton(text="🎵 Ататюрк", callback_data="sched_ататюрк"),
-                InlineKeyboardButton(text="🎸 Арбат",   callback_data="sched_арбат"),
-            ],
-        ]
+    kb = InlineKeyboardMarkup()
+    kb.row(InlineKeyboardButton("📅 Всё расписание", callback_data="schedule"))
+    kb.row(
+        InlineKeyboardButton("📅 Завтра",      callback_data="sched_day_tomorrow"),
+        InlineKeyboardButton("📅 Послезавтра", callback_data="sched_day_dat"),
     )
+    kb.row(
+        InlineKeyboardButton("🏠 Самал",   callback_data="sched_самал"),
+        InlineKeyboardButton("🎵 Ататюрк", callback_data="sched_ататюрк"),
+        InlineKeyboardButton("🎸 Арбат",   callback_data="sched_арбат"),
+    )
+    return kb
+
 
 def get_date_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📅 Сегодня", callback_data=f"date_today_{user_id}"),
-                InlineKeyboardButton(text="📅 Завтра",  callback_data=f"date_tomorrow_{user_id}"),
-            ],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"date_cancel_{user_id}")],
-        ]
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("📅 Завтра",      callback_data=f"date_tomorrow_{user_id}"),
+        InlineKeyboardButton("📅 Послезавтра", callback_data=f"date_dat_{user_id}"),
     )
+    kb.row(InlineKeyboardButton("❌ Отмена", callback_data=f"date_cancel_{user_id}"))
+    return kb
 
 # ─── Handlers ─────────────────────────────────────────────────────────────────
 
-@dp.message(Command("start"))
-async def start(message: Message):
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
     text = (
         "🎸 <b>Бот бронирования репетиционных площадок</b>\n\n"
-        "📍 <b>Доступные площадки:</b>\n"
-        "  🏠 Самал\n"
-        "  🎵 Ататюрк\n"
-        "  🎸 Арбат\n\n"
-        "📌 <b>Команды:</b>\n"
-        "  <code>/book 18:00 20:00 самал</code> — забронировать\n"
-        "  <code>/schedule</code> — всё расписание\n"
-        "  <code>/cancel самал</code> — отменить бронь\n\n"
-        "⏱ Максимальная длительность — <b>3 часа</b>"
+        "📍 <b>Площадки:</b>\n"
+        "  🏠 Самал  |  🎵 Ататюрк  |  🎸 Арбат\n\n"
+        "📌 Введи <code>/help</code> чтобы увидеть все команды с примерами"
     )
-    sent = await message.answer(text, reply_markup=get_main_keyboard(), parse_mode="HTML")
+    sent = bot.send_message(message.chat.id, text, reply_markup=get_main_keyboard())
     schedule_delete(sent)
 
-@dp.message(Command("schedule"))
-async def schedule_cmd(message: Message):
-    await send_auto(message, get_schedule_text(), reply_markup=get_main_keyboard())
 
-@dp.message(Command("book"))
-async def book(message: Message):
+@bot.message_handler(commands=["help"])
+def cmd_help(message):
+    text = (
+        "📖 <b>Справка по командам</b>\n\n"
+        "▶️ <b>/book</b> — забронировать время\n"
+        "  Формат: <code>/book ЧЧ:ММ ЧЧ:ММ площадка</code>\n"
+        "  Примеры:\n"
+        "  <code>/book 18:00 20:00 самал</code>\n"
+        "  <code>/book 14:30 16:00 ататюрк</code>\n"
+        "  <code>/book 20:00 22:00 арбат</code>\n"
+        "  ⏱ Максимум 3 часа. Бот спросит: завтра или послезавтра.\n\n"
+        "📋 <b>/schedule</b> — всё расписание\n"
+        "  Показывает все брони на завтра и послезавтра.\n"
+        "  Пример: <code>/schedule</code>\n\n"
+        "❌ <b>/cancel</b> — отменить свою бронь\n"
+        "  Формат: <code>/cancel площадка</code>\n"
+        "  Примеры:\n"
+        "  <code>/cancel самал</code>\n"
+        "  <code>/cancel ататюрк</code>\n"
+        "  <code>/cancel арбат</code>\n\n"
+        "📍 <b>Площадки:</b> самал, ататюрк, арбат\n"
+        "📆 <b>Окно бронирования:</b> завтра и послезавтра\n"
+        "🕛 <b>Сброс расписания:</b> каждый день в 00:00"
+    )
+    sent = bot.send_message(message.chat.id, text)
+    schedule_delete(sent, delay=120)
+
+
+@bot.message_handler(commands=["schedule"])
+def cmd_schedule(message):
+    sent = bot.send_message(message.chat.id, get_schedule_text(), reply_markup=get_main_keyboard())
+    schedule_delete(sent)
+
+
+@bot.message_handler(commands=["book"])
+def cmd_book(message):
     try:
         args = message.text.split()
         if len(args) < 4:
-            raise ValueError("not enough args")
+            raise ValueError
+
         start = args[1]
         end   = args[2]
         venue = args[3].lower()
+
+        try:
+            start_m = parse_time(start)
+        except ValueError:
+            sent = bot.send_message(message.chat.id,
+                f"❌ <b>Неверное время начала:</b> <code>{start}</code>\n"
+                "Используй формат <code>ЧЧ:ММ</code>, например <code>18:00</code>.\n"
+                "Часы: 00–23, минуты: 00–59.")
+            schedule_delete(sent)
+            return
+
+        try:
+            end_m = parse_time(end)
+        except ValueError:
+            sent = bot.send_message(message.chat.id,
+                f"❌ <b>Неверное время окончания:</b> <code>{end}</code>\n"
+                "Используй формат <code>ЧЧ:ММ</code>, например <code>20:00</code>.\n"
+                "Часы: 00–23, минуты: 00–59.")
+            schedule_delete(sent)
+            return
+
         if venue not in VENUES:
             venues_list = ", ".join(f"<b>{v}</b>" for v in VENUES)
-            await send_auto(message, f"❌ Площадка <b>«{venue}»</b> не найдена.\n\n📍 Доступные площадки: {venues_list}")
+            sent = bot.send_message(message.chat.id,
+                f"❌ Площадка <b>«{venue}»</b> не найдена.\n\n📍 Доступные: {venues_list}")
+            schedule_delete(sent)
             return
-        start_m = time_to_minutes(start)
-        end_m   = time_to_minutes(end)
-        if end_m <= start_m:
-            await send_auto(message, "❌ <b>Неверное время!</b>\nВремя окончания должно быть позже начала.")
-            return
-        if end_m - start_m > 180:
-            await send_auto(message, "❌ <b>Слишком долго!</b>\nМаксимальная длительность — <b>3 часа</b>.")
-            return
-        user_id = message.from_user.id
-        pending_bookings[user_id] = {"start": start, "end": end, "venue": venue}
-        emoji = VENUE_EMOJI[venue]
-        await send_auto(
-            message,
-            f"📅 <b>На какой день?</b>\n\n{emoji} <b>{venue.upper()}</b>  🕒 <code>{start} – {end}</code>",
-            reply_markup=get_date_keyboard(user_id),
-            delay=120,
-        )
-    except (IndexError, ValueError):
-        await send_auto(message, "ℹ️ <b>Формат команды:</b>\n<code>/book 18:00 20:00 самал</code>\n\n📍 Площадки: самал, ататюрк, арбат")
 
-@dp.callback_query(F.data.startswith("date_"))
-async def handle_date_choice(callback: CallbackQuery):
-    parts    = callback.data.split("_")
+        if end_m <= start_m:
+            sent = bot.send_message(message.chat.id,
+                "❌ <b>Неверное время!</b>\nОкончание должно быть позже начала.")
+            schedule_delete(sent)
+            return
+
+        if end_m - start_m > 180:
+            sent = bot.send_message(message.chat.id,
+                "❌ <b>Слишком долго!</b>\nМаксимум — <b>3 часа</b>.")
+            schedule_delete(sent)
+            return
+
+        user_id = message.from_user.id
+        with _lock:
+            pending_bookings[user_id] = {"start": start, "end": end, "venue": venue}
+
+        sent = bot.send_message(
+            message.chat.id,
+            f"📅 <b>На какой день?</b>\n\n"
+            f"{VENUE_EMOJI[venue]} <b>{venue.upper()}</b>  🕒 <code>{start} – {end}</code>",
+            reply_markup=get_date_keyboard(user_id),
+        )
+        schedule_delete(sent, delay=120)
+
+    except (IndexError, ValueError):
+        sent = bot.send_message(message.chat.id,
+            "ℹ️ <b>Формат:</b> <code>/book 18:00 20:00 самал</code>\n\n"
+            "📍 Площадки: самал, ататюрк, арбат")
+        schedule_delete(sent)
+
+
+@bot.message_handler(commands=["cancel"])
+def cmd_cancel(message):
+    args      = message.text.split()
+    user_name = message.from_user.first_name
+
+    if len(args) < 2:
+        sent = bot.send_message(message.chat.id,
+            "ℹ️ <b>Формат:</b> <code>/cancel самал</code>\n\n"
+            "📍 Площадки: самал, ататюрк, арбат")
+        schedule_delete(sent)
+        return
+
+    venue = args[1].lower()
+
+    if venue not in VENUES:
+        venues_list = ", ".join(f"<b>{v}</b>" for v in VENUES)
+        sent = bot.send_message(message.chat.id,
+            f"❌ Площадка <b>«{venue}»</b> не найдена.\n\n📍 Доступные: {venues_list}")
+        schedule_delete(sent)
+        return
+
+    for d in (tomorrow_str(), day_after_tomorrow_str()):
+        with _lock:
+            if user_name in bookings[venue].get(d, {}):
+                data = bookings[venue][d].pop(user_name)
+                s1 = bot.send_message(message.chat.id,
+                    f"🗑 <b>Бронь отменена</b>\n\n"
+                    f"{VENUE_EMOJI[venue]} <b>{venue.upper()}</b> — {format_date_label(d)}\n"
+                    f"<code>{data['start']} – {data['end']}</code>")
+                s2 = bot.send_message(message.chat.id, get_schedule_text(), reply_markup=get_main_keyboard())
+                schedule_delete(s1)
+                schedule_delete(s2)
+                return
+
+    sent = bot.send_message(message.chat.id,
+        f"ℹ️ У тебя нет брони на {VENUE_EMOJI[venue]} <b>{venue.upper()}</b>.")
+    schedule_delete(sent)
+
+
+@bot.message_handler(commands=["admin"])
+def cmd_admin(message):
+    if not is_admin(message.from_user.id):
+        sent = bot.send_message(message.chat.id, "⛔ Нет доступа.")
+        schedule_delete(sent)
+        return
+    sent = bot.send_message(message.chat.id, get_admin_text(), reply_markup=get_admin_keyboard())
+    schedule_delete(sent, delay=300)
+
+# ─── Booking callbacks ────────────────────────────────────────────────────────
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("date_"))
+def cb_date(call):
+    parts    = call.data.split("_")
     action   = parts[1]
     owner_id = parts[2] if len(parts) > 2 else None
-    if owner_id and str(callback.from_user.id) != owner_id:
-        await callback.answer("Это не ваш запрос.", show_alert=True)
+
+    if owner_id and str(call.from_user.id) != owner_id:
+        bot.answer_callback_query(call.id, "Это не ваш запрос.", show_alert=True)
         return
-    user_id = callback.from_user.id
+
+    user_id = call.from_user.id
+
     if action == "cancel":
-        pending_bookings.pop(user_id, None)
-        await callback.message.edit_text("❌ Бронирование отменено.", parse_mode="HTML")
-        await callback.answer()
+        with _lock:
+            pending_bookings.pop(user_id, None)
+        bot.edit_message_text("❌ Бронирование отменено.", call.message.chat.id, call.message.message_id)
+        bot.answer_callback_query(call.id)
         return
-    pending = pending_bookings.pop(user_id, None)
+
+    with _lock:
+        pending = pending_bookings.pop(user_id, None)
+
     if not pending:
-        await callback.answer("Запрос устарел. Попробуйте снова.", show_alert=True)
+        bot.answer_callback_query(call.id, "Запрос устарел. Попробуйте снова.", show_alert=True)
         return
-    date_str = today_str() if action == "today" else tomorrow_str()
+
+    date_str = tomorrow_str() if action == "tomorrow" else day_after_tomorrow_str()
     start    = pending["start"]
     end      = pending["end"]
     venue    = pending["venue"]
     start_m  = time_to_minutes(start)
     end_m    = time_to_minutes(end)
-    day_slots = bookings[venue].get(date_str, {})
-    for user, data in day_slots.items():
+
+    for user, data in bookings[venue].get(date_str, {}).items():
         if overlaps(start_m, end_m, time_to_minutes(data["start"]), time_to_minutes(data["end"])):
-            emoji = VENUE_EMOJI[venue]
-            await callback.message.edit_text(
-                f"❌ <b>Время занято!</b>\n\n{emoji} <b>{venue.upper()}</b> — {format_date_label(date_str)}\n"
+            bot.edit_message_text(
+                f"❌ <b>Время занято!</b>\n\n"
+                f"{VENUE_EMOJI[venue]} <b>{venue.upper()}</b> — {format_date_label(date_str)}\n"
                 f"<code>{data['start']} – {data['end']}</code>  👤 {user}",
-                parse_mode="HTML",
-            )
-            schedule_delete(callback.message, 60)
-            await callback.answer()
+                call.message.chat.id, call.message.message_id)
+            schedule_delete(call.message, 60)
+            bot.answer_callback_query(call.id)
             return
-    user_name = callback.from_user.first_name
-    bookings[venue].setdefault(date_str, {})[user_name] = {"start": start, "end": end}
-    ttl = TTL_TODAY if action == "today" else TTL_TOMORROW
-    schedule_booking_ttl(venue, date_str, user_name, ttl)
-    emoji = VENUE_EMOJI[venue]
-    await callback.message.edit_text(
-        f"✅ <b>Забронировано!</b>\n\n{emoji} <b>{venue.upper()}</b>\n"
-        f"📆 {format_date_label(date_str)}\n🕒 <code>{start} – {end}</code>\n👤 {user_name}",
-        parse_mode="HTML",
-    )
-    schedule_delete(callback.message, 60)
-    await callback.answer()
-    sent = await callback.message.answer(get_schedule_text(), reply_markup=get_main_keyboard(), parse_mode="HTML")
+
+    user_name = call.from_user.first_name
+    with _lock:
+        bookings[venue].setdefault(date_str, {})[user_name] = {"start": start, "end": end}
+
+    bot.edit_message_text(
+        f"✅ <b>Забронировано!</b>\n\n"
+        f"{VENUE_EMOJI[venue]} <b>{venue.upper()}</b>\n"
+        f"📆 {format_date_label(date_str)}\n"
+        f"🕒 <code>{start} – {end}</code>\n"
+        f"👤 {user_name}",
+        call.message.chat.id, call.message.message_id)
+    schedule_delete(call.message, 60)
+    bot.answer_callback_query(call.id)
+
+    sent = bot.send_message(call.message.chat.id, get_schedule_text(), reply_markup=get_main_keyboard())
     schedule_delete(sent)
 
-@dp.message(Command("cancel"))
-async def cancel(message: Message):
-    args      = message.text.split()
-    user_name = message.from_user.first_name
-    if len(args) < 2:
-        await send_auto(message, "ℹ️ <b>Формат команды:</b>\n<code>/cancel самал</code>\n\n📍 Площадки: самал, ататюрк, арбат")
+# ─── Schedule view callbacks ──────────────────────────────────────────────────
+
+@bot.callback_query_handler(func=lambda c: c.data == "schedule")
+def cb_schedule(call):
+    sent = bot.send_message(call.message.chat.id, get_schedule_text(), reply_markup=get_main_keyboard())
+    schedule_delete(sent)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "sched_day_tomorrow")
+def cb_sched_tomorrow(call):
+    sent = bot.send_message(call.message.chat.id,
+        get_day_schedule_text(tomorrow_str()), reply_markup=get_main_keyboard())
+    schedule_delete(sent)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "sched_day_dat")
+def cb_sched_dat(call):
+    sent = bot.send_message(call.message.chat.id,
+        get_day_schedule_text(day_after_tomorrow_str()), reply_markup=get_main_keyboard())
+    schedule_delete(sent)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sched_"))
+def cb_venue_schedule(call):
+    venue = call.data.replace("sched_", "")
+    if venue in VENUES:
+        sent = bot.send_message(call.message.chat.id, get_venue_schedule_text(venue))
+        schedule_delete(sent)
+    bot.answer_callback_query(call.id)
+
+# ─── Admin callbacks ──────────────────────────────────────────────────────────
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("adm_"))
+def cb_admin(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔ Нет доступа.", show_alert=True)
         return
-    venue = args[1].lower()
-    if venue not in VENUES:
-        venues_list = ", ".join(f"<b>{v}</b>" for v in VENUES)
-        await send_auto(message, f"❌ Площадка <b>«{venue}»</b> не найдена.\n\n📍 Доступные площадки: {venues_list}")
-        return
-    for d in (today_str(), tomorrow_str()):
-        if user_name in bookings[venue].get(d, {}):
-            data  = bookings[venue][d].pop(user_name)
-            emoji = VENUE_EMOJI[venue]
-            await send_auto(message, f"🗑 <b>Бронь отменена</b>\n\n{emoji} <b>{venue.upper()}</b> — {format_date_label(d)}\n<code>{data['start']} – {data['end']}</code>")
-            await send_auto(message, get_schedule_text(), reply_markup=get_main_keyboard())
-            return
-    emoji = VENUE_EMOJI[venue]
-    await send_auto(message, f"ℹ️ У тебя нет брони на {emoji} <b>{venue.upper()}</b>.")
 
-@dp.callback_query(F.data == "schedule")
-async def show_schedule(callback: CallbackQuery):
-    sent = await callback.message.answer(get_schedule_text(), reply_markup=get_main_keyboard(), parse_mode="HTML")
-    schedule_delete(sent)
-    await callback.answer()
+    data = call.data
 
-@dp.callback_query(F.data == "sched_day_today")
-async def show_today_schedule(callback: CallbackQuery):
-    sent = await callback.message.answer(get_day_schedule_text(today_str()), reply_markup=get_main_keyboard(), parse_mode="HTML")
-    schedule_delete(sent)
-    await callback.answer()
+    if data == "adm_view":
+        sent = bot.send_message(call.message.chat.id, get_schedule_text(), reply_markup=get_main_keyboard())
+        schedule_delete(sent)
+        bot.answer_callback_query(call.id)
 
-@dp.callback_query(F.data == "sched_day_tomorrow")
-async def show_tomorrow_schedule(callback: CallbackQuery):
-    sent = await callback.message.answer(get_day_schedule_text(tomorrow_str()), reply_markup=get_main_keyboard(), parse_mode="HTML")
-    schedule_delete(sent)
-    await callback.answer()
+    elif data == "adm_clear_tomorrow":
+        tomorrow = tomorrow_str()
+        with _lock:
+            for venue in VENUES:
+                bookings[venue].pop(tomorrow, None)
+        bot.edit_message_text(
+            f"🗑 <b>Брони на завтра ({format_date_label(tomorrow)}) удалены.</b>",
+            call.message.chat.id, call.message.message_id,
+            reply_markup=get_admin_keyboard())
+        bot.answer_callback_query(call.id, "✅ Завтра очищено")
 
-@dp.callback_query(F.data.startswith("sched_"))
-async def show_venue_schedule(callback: CallbackQuery):
-    venue = callback.data.replace("sched_", "")
-    sent  = await callback.message.answer(get_venue_schedule_text(venue), parse_mode="HTML")
-    schedule_delete(sent)
-    await callback.answer()
+    elif data == "adm_clear_dat":
+        dat = day_after_tomorrow_str()
+        with _lock:
+            for venue in VENUES:
+                bookings[venue].pop(dat, None)
+        bot.edit_message_text(
+            f"🗑 <b>Брони на послезавтра ({format_date_label(dat)}) удалены.</b>",
+            call.message.chat.id, call.message.message_id,
+            reply_markup=get_admin_keyboard())
+        bot.answer_callback_query(call.id, "✅ Послезавтра очищено")
+
+    elif data == "adm_clear_all":
+        with _lock:
+            for venue in VENUES:
+                bookings[venue].clear()
+        bot.edit_message_text(
+            "💣 <b>Все брони удалены.</b>",
+            call.message.chat.id, call.message.message_id,
+            reply_markup=get_admin_keyboard())
+        bot.answer_callback_query(call.id, "✅ Всё очищено")
+
+    else:
+        bot.answer_callback_query(call.id)
+
+# ─── Register bot commands ────────────────────────────────────────────────────
+
+def register_commands():
+    bot.set_my_commands([
+        BotCommand("schedule", "Расписание репетиций"),
+    ])
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
-async def main():
-    asyncio.create_task(auto_delete_loop())
-    asyncio.create_task(auto_expire_bookings_loop())
+if __name__ == "__main__":
+    threading.Thread(target=auto_delete_worker,      daemon=True).start()
+    threading.Thread(target=midnight_cleanup_worker, daemon=True).start()
+    keep_alive()
+    bot.delete_webhook(drop_pending_updates=True)
+    register_commands()
     print("Бот запущен")
-    await dp.start_polling(bot)
-
-
-keep_alive()
-asyncio.run(main())
+    bot.infinity_polling(restart_on_change=False, timeout=30, long_polling_timeout=20)
