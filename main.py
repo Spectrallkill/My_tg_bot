@@ -60,18 +60,18 @@ def today_str() -> str:
     return date.today().isoformat()
 
 def tomorrow_str() -> str:
-    return (date.today() + timedelta(days=1)).isoformat()
+    return date.today().isoformat()
 
 def day_after_tomorrow_str() -> str:
-    return (date.today() + timedelta(days=2)).isoformat()
+    return (date.today() + timedelta(days=1)).isoformat()
 
 def format_date_label(date_str: str) -> str:
     d     = date.fromisoformat(date_str)
     today = date.today()
+    if d == today:
+        return f"Сегодня, {d.strftime('%d.%m')}"
     if d == today + timedelta(days=1):
         return f"Завтра, {d.strftime('%d.%m')}"
-    if d == today + timedelta(days=2):
-        return f"Послезавтра, {d.strftime('%d.%m')}"
     return d.strftime("%d.%m.%Y")
 
 # ─── Background: auto-delete messages ─────────────────────────────────────────
@@ -101,12 +101,12 @@ def midnight_cleanup_worker():
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         time.sleep((next_midnight - now).total_seconds())
 
-        today = date.today().isoformat()
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
         with _lock:
             for venue in VENUES:
-                bookings[venue].pop(today, None)
+                bookings[venue].pop(yesterday, None)
             for venue in VENUES:
-                stale = [d for d in list(bookings[venue]) if d < today]
+                stale = [d for d in list(bookings[venue]) if d < yesterday]
                 for d in stale:
                     del bookings[venue][d]
 
@@ -140,7 +140,7 @@ def get_schedule_text() -> str:
     if not any_booking:
         lines.append("✨ Все площадки свободны!")
         return "\n".join(lines)
-    for d, day_label in [(tomorrow, "📆 Завтра"), (dat, "📆 Послезавтра")]:
+    for d, day_label in [(tomorrow, "📆 Сегодня"), (dat, "📆 Завтра")]:
         if not any(bookings[v].get(d) for v in VENUES):
             continue
         lines.append(day_label)
@@ -182,7 +182,7 @@ def get_venue_schedule_text(venue: str) -> str:
     if not any(bookings[venue].get(d) for d in (tomorrow, dat)):
         lines.append("✨ Площадка свободна!")
         return "\n".join(lines)
-    for d, day_label in [(tomorrow, "📆 Завтра"), (dat, "📆 Послезавтра")]:
+    for d, day_label in [(tomorrow, "📆 Сегодня"), (dat, "📆 Завтра")]:
         slots = bookings[venue].get(d, {})
         if not slots:
             continue
@@ -202,12 +202,12 @@ def get_admin_text() -> str:
     lines    = [
         "🔐 <b>Админ-панель</b>\n",
         f"📊 Активных броней: <b>{total}</b>\n",
-        f"📆 <b>Завтра ({format_date_label(tomorrow)}):</b>",
+        f"📆 <b>Сегодня ({format_date_label(tomorrow)}):</b>",
     ]
     for venue in VENUES:
         count = len(bookings[venue].get(tomorrow, {}))
         lines.append(f"  {VENUE_EMOJI[venue]} {venue.upper()}: {count}")
-    lines.append(f"\n📆 <b>Послезавтра ({format_date_label(dat)}):</b>")
+    lines.append(f"\n📆 <b>Завтра ({format_date_label(dat)}):</b>")
     for venue in VENUES:
         count = len(bookings[venue].get(dat, {}))
         lines.append(f"  {VENUE_EMOJI[venue]} {venue.upper()}: {count}")
@@ -218,8 +218,8 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     kb.row(InlineKeyboardButton("📋 Всё расписание", callback_data="adm_view"))
     kb.row(
-        InlineKeyboardButton("🗑 Завтра",       callback_data="adm_clear_tomorrow"),
-        InlineKeyboardButton("🗑 Послезавтра",  callback_data="adm_clear_dat"),
+        InlineKeyboardButton("🗑 Сегодня", callback_data="adm_clear_tomorrow"),
+        InlineKeyboardButton("🗑 Завтра",  callback_data="adm_clear_dat"),
     )
     kb.row(InlineKeyboardButton("💣 Очистить ВСЁ", callback_data="adm_clear_all"))
     return kb
@@ -230,8 +230,8 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     kb.row(InlineKeyboardButton("📅 Всё расписание", callback_data="schedule"))
     kb.row(
-        InlineKeyboardButton("📅 Завтра",      callback_data="sched_day_tomorrow"),
-        InlineKeyboardButton("📅 Послезавтра", callback_data="sched_day_dat"),
+        InlineKeyboardButton("📅 Сегодня", callback_data="sched_day_tomorrow"),
+        InlineKeyboardButton("📅 Завтра",  callback_data="sched_day_dat"),
     )
     kb.row(
         InlineKeyboardButton("🏠 Самал",   callback_data="sched_самал"),
@@ -244,8 +244,8 @@ def get_main_keyboard() -> InlineKeyboardMarkup:
 def get_date_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     kb.row(
-        InlineKeyboardButton("📅 Завтра",      callback_data=f"date_tomorrow_{user_id}"),
-        InlineKeyboardButton("📅 Послезавтра", callback_data=f"date_dat_{user_id}"),
+        InlineKeyboardButton("📅 Сегодня", callback_data=f"date_tomorrow_{user_id}"),
+        InlineKeyboardButton("📅 Завтра",  callback_data=f"date_dat_{user_id}"),
     )
     kb.row(InlineKeyboardButton("❌ Отмена", callback_data=f"date_cancel_{user_id}"))
     return kb
@@ -285,7 +285,7 @@ def cmd_help(message):
         "  <code>/cancel ататюрк</code>\n"
         "  <code>/cancel арбат</code>\n\n"
         "📍 <b>Площадки:</b> самал, ататюрк, арбат\n"
-        "📆 <b>Окно бронирования:</b> завтра и послезавтра\n"
+        "📆 <b>Окно бронирования:</b> сегодня и завтра\n"
         "🕛 <b>Сброс расписания:</b> каждый день в 00:00"
     )
     sent = bot.send_message(message.chat.id, text)
@@ -532,10 +532,10 @@ def cb_admin(call):
             for venue in VENUES:
                 bookings[venue].pop(tomorrow, None)
         bot.edit_message_text(
-            f"🗑 <b>Брони на завтра ({format_date_label(tomorrow)}) удалены.</b>",
+            f"🗑 <b>Брони на сегодня ({format_date_label(tomorrow)}) удалены.</b>",
             call.message.chat.id, call.message.message_id,
             reply_markup=get_admin_keyboard())
-        bot.answer_callback_query(call.id, "✅ Завтра очищено")
+        bot.answer_callback_query(call.id, "✅ Сегодня очищено")
 
     elif data == "adm_clear_dat":
         dat = day_after_tomorrow_str()
@@ -543,10 +543,10 @@ def cb_admin(call):
             for venue in VENUES:
                 bookings[venue].pop(dat, None)
         bot.edit_message_text(
-            f"🗑 <b>Брони на послезавтра ({format_date_label(dat)}) удалены.</b>",
+            f"🗑 <b>Брони на завтра ({format_date_label(dat)}) удалены.</b>",
             call.message.chat.id, call.message.message_id,
             reply_markup=get_admin_keyboard())
-        bot.answer_callback_query(call.id, "✅ Послезавтра очищено")
+        bot.answer_callback_query(call.id, "✅ Завтра очищено")
 
     elif data == "adm_clear_all":
         with _lock:
