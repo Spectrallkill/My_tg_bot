@@ -574,7 +574,17 @@ if __name__ == "__main__":
     threading.Thread(target=auto_delete_worker,      daemon=True).start()
     threading.Thread(target=midnight_cleanup_worker, daemon=True).start()
     keep_alive()
-    bot.delete_webhook(drop_pending_updates=True)
+
+    # Wait for any previous instance to release the getUpdates lock
+    for attempt in range(10):
+        try:
+            bot.delete_webhook(drop_pending_updates=True)
+            bot.get_me()
+            break
+        except Exception as e:
+            print(f"Ожидание завершения старого экземпляра... ({attempt+1}/10): {e}")
+            time.sleep(6)
+
     register_commands()
     print("Бот запущен")
     bot.infinity_polling(restart_on_change=False, timeout=30, long_polling_timeout=20)
