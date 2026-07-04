@@ -575,16 +575,32 @@ if __name__ == "__main__":
     threading.Thread(target=midnight_cleanup_worker, daemon=True).start()
     keep_alive()
 
-    # Wait for any previous instance to release the getUpdates lock
-    for attempt in range(10):
+    # Wait until getUpdates is free (409 = another instance still running)
+    for attempt in range(20):
         try:
             bot.delete_webhook(drop_pending_updates=True)
-            bot.get_me()
+            bot.get_updates(offset=-1, limit=1, timeout=1)
+            print(f"Telegram API свободен, запускаю бота")
             break
         except Exception as e:
-            print(f"Ожидание завершения старого экземпляра... ({attempt+1}/10): {e}")
-            time.sleep(6)
+            msg = str(e)
+            if "409" in msg:
+                print(f"409 конфликт — жду ({attempt+1}/20)...")
+                time.sleep(10)
+            else:
+                print(f"Ошибка при проверке: {e}")
+                time.sleep(5)
 
     register_commands()
     print("Бот запущен")
-    bot.infinity_polling(restart_on_change=False, timeout=30, long_polling_timeout=20)
+    while True:
+        try:
+            bot.infinity_polling(restart_on_change=False, timeout=30, long_polling_timeout=20)
+        except Exception as e:
+            if "409" in str(e):
+                print("409 в polling — пауза 15 сек...")
+                time.sleep(15)
+                bot.delete_webhook(drop_pending_updates=True)
+            else:
+                print(f"Ошибка polling: {e}, перезапуск через 5 сек...")
+                time.sleep(5)
