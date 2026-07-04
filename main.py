@@ -5,25 +5,8 @@ import threading
 from datetime import date, datetime, timedelta
 
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
-from flask import Flask
-
-# ─── Keep-alive Flask server ──────────────────────────────────────────────────
-
-flask_app = Flask(__name__)
-
-@flask_app.route("/")
-def home():
-    return "I am alive!"
-
-def keep_alive():
-    port = int(os.environ.get("PORT", 8080))
-    def run():
-        try:
-            flask_app.run(host="0.0.0.0", port=port)
-        except OSError:
-            pass
-    threading.Thread(target=run, daemon=True).start()
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, Update
+from flask import Flask, request, abort
 
 # ─── Bot & config ─────────────────────────────────────────────────────────────
 
@@ -561,6 +544,22 @@ def cb_admin(call):
     else:
         bot.answer_callback_query(call.id)
 
+# ─── Flask app & webhook ──────────────────────────────────────────────────────
+
+flask_app = Flask(__name__)
+
+@flask_app.route("/", methods=["GET", "HEAD"])
+def home():
+    return "I am alive!"
+
+@flask_app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    if request.headers.get("content-type") != "application/json":
+        abort(403)
+    update = Update.de_json(request.get_json(force=True))
+    bot.process_new_updates([update])
+    return "ok", 200
+
 # ─── Register bot commands ────────────────────────────────────────────────────
 
 def register_commands():
@@ -573,34 +572,20 @@ def register_commands():
 if __name__ == "__main__":
     threading.Thread(target=auto_delete_worker,      daemon=True).start()
     threading.Thread(target=midnight_cleanup_worker, daemon=True).start()
-    keep_alive()
 
-    # Wait until getUpdates is free (409 = another instance still running)
-    for attempt in range(20):
-        try:
-            bot.delete_webhook(drop_pending_updates=True)
-            bot.get_updates(offset=-1, limit=1, timeout=1)
-            print(f"Telegram API свободен, запускаю бота")
-            break
-        except Exception as e:
-            msg = str(e)
-            if "409" in msg:
-                print(f"409 конфликт — жду ({attempt+1}/20)...")
-                time.sleep(10)
-            else:
-                print(f"Ошибка при проверке: {e}")
-                time.sleep(5)
+    # Set webhook using Render's external URL
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if render_url:
+        webhook_url = f"{render_url}/{TOKEN}"
+        bot.remove_webhook()
+        time.sleep(1)
+        bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+        print(f"Webhook установлен: {render_url}/***")
+    else:
+        print("RENDER_EXTERNAL_URL не задан — webhook не установлен")
 
     register_commands()
-    print("Бот запущен")
-    while True:
-        try:
-            bot.infinity_polling(restart_on_change=False, timeout=30, long_polling_timeout=20)
-        except Exception as e:
-            if "409" in str(e):
-                print("409 в polling — пауза 15 сек...")
-                time.sleep(15)
-                bot.delete_webhook(drop_pending_updates=True)
-            else:
-                print(f"Ошибка polling: {e}, перезапуск через 5 сек...")
-                time.sleep(5)
+    print("Бот запущен (webhook mode)")
+
+    port = int(os.environ.get("PORT", 8080))
+    flask_app.run(host="0.0.0.0", port=port)
