@@ -28,7 +28,7 @@ pending_bookings: dict = {}
 delete_queue:     list = []
 
 DELETE_AFTER = 60
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 # ─── Admin check ──────────────────────────────────────────────────────────────
 
